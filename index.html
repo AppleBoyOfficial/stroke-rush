@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Stroke Rush</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1f6f8f">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Stroke Rush">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0b1d2e; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+         font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+"use strict";
+
+// ---------- Setup ----------
+const cv = document.getElementById("c");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = Math.floor(W * DPR); cv.height = Math.floor(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+window.addEventListener("resize", resize);
+resize();
+
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = arr => arr[Math.floor(Math.random() * arr.length)];
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ---------- Audio ----------
+let AC = null, master = null, noiseBuf = null;
+function initAudio() {
+  if (AC) { if (AC.state === "suspended") AC.resume().catch(() => {}); return; }
+  try {
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = 0.5; master.connect(AC.destination);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate * 0.5, AC.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  } catch (e) { AC = null; }
+}
+function tone(freq, dur, type, vol, slideTo) {
+  if (!AC) return;
+  const t = AC.currentTime, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type || "sine"; o.frequency.setValueAtTime(freq, t);
+  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(master); o.start(t); o.stop(t + dur + 0.02);
+}
+function noise(dur, vol, filterFreq, type) {
+  if (!AC) return;
+  const t = AC.currentTime, s = AC.createBufferSource(), f = AC.createBiquadFilter(), g = AC.createGain();
+  s.buffer = noiseBuf; f.type = type || "bandpass"; f.frequency.value = filterFreq || 1200;
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  s.connect(f); f.connect(g); g.connect(master); s.start(t); s.stop(t + dur + 0.02);
+}
+const SFX = {
+  kick() { tone(140, 0.18, "sine", 0.55, 45); },
+  hat() { noise(0.05, 0.12, 8000, "highpass"); },
+  bass(n) { tone(n, 0.22, "triangle", 0.22); },
+  lead(n) { tone(n, 0.16, "square", 0.05); },
+  splashGood() { noise(0.18, 0.18, 900); },
+  splashBad() { noise(0.25, 0.3, 300, "lowpass"); tone(90, 0.15, "sine", 0.2); },
+  coin() { tone(988, 0.07, "square", 0.06); setTimeout(() => tone(1319, 0.1, "square", 0.06), 60); },
+  power() { tone(440, 0.3, "sawtooth", 0.08, 1760); },
+  crash() { noise(0.5, 0.5, 200, "lowpass"); tone(120, 0.4, "sawtooth", 0.15, 40); },
+  jump() { tone(300, 0.15, "sine", 0.12, 700); },
+  siren() { tone(700, 0.25, "square", 0.04, 500); }
+};
+const BASS = [55, 55, 82.4, 73.4, 55, 55, 98, 82.4];
+const LEAD = [440, 523, 659, 523, 587, 659, 784, 659];
+
+// ---------- Constants ----------
+const LANES = [-1.15, 0, 1.15];
+const CANAL = 1.9;
+const D = 5.5;            // focal distance
+const FAR = 75;
+const POWER_TIME = 8;
+const POWERS = {
+  cox:   { name: "COXSWAIN", color: "#ffd23f", icon: "C", desc: "Perfect rhythm, auto" },
+  motor: { name: "OUTBOARD", color: "#ff6b6b", icon: "M", desc: "Top speed, no rowing" },
+  eight: { name: "EIGHT",    color: "#4dd4ff", icon: "8", desc: "Smash everything" }
+};
+
+// ---------- State ----------
+let state = "title";   // title | play | over | paused
+let G = null;
+let best = store.get("strokerush_best", 0);
+let totalCoins = store.get("strokerush_coins", 0);
+let gameTime = 0;
+const popups = [];
+const particles = [];
+
+function newGame() {
+  G = {
+    dist: 0, score: 0, coins: 0,
+    v: 14, lane: 1, x: 0, jumpH: 0, jumpV: 0, duck: 0,
+    swing: 0, maxSwing: 0, perfects: 0,
+    beatClock: 0, beatCount: 0, T: 0.52, ringFlash: 0,
+    lastSide: null, lastStrokeT: -Infinity, oarL: 0, oarR: 0, nextSide: "L",
+    gap: 70, copSpeed: 11, invuln: 0, stumbles: 0,
+    objs: [], nextSpawn: 20, power: null, powerT: 0,
+    shake: 0, sirenT: 0, offset: 0
+  };
+  popups.length = 0; particles.length = 0;
+}
+
+// ---------- Projection ----------
+function geom() {
+  const unit = Math.min(W * 0.27, H * 0.2);
+  return { horizon: H * 0.3, base: H * 0.8, unit };
+}
+function proj(x, z, y) {
+  const g = geom();
+  const s = D / (D + Math.max(z, -D + 0.5));
+  return {
+    x: W / 2 + x * s * g.unit,
+    y: g.horizon + (g.base - g.horizon) * s - (y || 0) * s * g.unit,
+    s: s * g.unit
+  };
+}
+
+// ---------- Spawning ----------
+function spawnRow(z) {
+  const diff = clamp(G.dist / 3000, 0, 1);
+  const r = Math.random();
+  const free = Math.floor(Math.random() * 3);
+  if (r < 0.14 + diff * 0.06) {
+    G.objs.push({ type: "bridge", x: 0, z, full: true });
+    G.objs.push({ type: "coin", x: LANES[free], z: z, y: 0.25 });
+  } else if (r < 0.26 + diff * 0.1) {
+    G.objs.push({ type: "boom", x: 0, z, full: true });
+    for (let i = 0; i < 3; i++) G.objs.push({ type: "coin", x: LANES[free], z: z + 0.1, y: 1.0 + Math.sin(i) * 0.1 });
+  } else {
+    // lane obstacles, leave at least one lane passable
+    const count = Math.random() < 0.35 + diff * 0.3 ? 2 : 1;
+    const lanes = [0, 1, 2].filter(l => l !== free);
+    for (let i = 0; i < count; i++) {
+      const l = lanes.splice(Math.floor(Math.random() * lanes.length), 1)[0];
+      const t = Math.random() < 0.6 ? "barge" : "log";
+      G.objs.push({ type: t, x: LANES[l], z: z + rand(0, 2) });
+    }
+    // coin trail in free lane
+    const n = 4 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < n; i++) G.objs.push({ type: "coin", x: LANES[free], z: z - 6 + i * 1.6, y: 0.25 });
+  }
+  if (!G.power && Math.random() < 0.07) {
+    const k = pick(Object.keys(POWERS));
+    G.objs.push({ type: "power", kind: k, x: LANES[free], z: z - 8, y: 0.45 });
+  }
+}
+
+// ---------- Rowing / rhythm ----------
+function beatError() {
+  const t = G.beatClock;
+  return Math.min(t, G.T - t);
+}
+function stroke(side, err, auto) {
+  if (state !== "play") return;
+  if (G.power === "motor" || (G.power === "cox" && !auto)) { animOar(side); return; }
+  if (err === undefined) err = beatError();
+  const now = gameTime;
+  const tooFast = now - G.lastStrokeT < G.T * 0.5;
+  const sameSide = G.lastSide === side;
+  G.lastStrokeT = now; G.lastSide = side;
+  G.nextSide = side === "L" ? "R" : "L";
+  animOar(side);
+  if (tooFast) {
+    G.swing = 0; G.v = Math.max(6, G.v - 1.5);
+    popup("SPLASH!", "#ff8a65"); SFX.splashBad(); splash(side, 6, "#a0c4ff");
+    return;
+  }
+  if (sameSide) {
+    G.swing = Math.max(0, G.swing - 3); G.v += 0.6;
+    popup("OFF BALANCE", "#ffb74d"); SFX.splashBad(); splash(side, 5, "#a0c4ff");
+    return;
+  }
+  if (err < 0.06) {
+    G.swing = Math.min(10, G.swing + 1); G.perfects++;
+    G.v += 3.1 * (1 + G.swing * 0.05);
+    popup("PERFECT", "#7cffb2"); SFX.splashGood(); splash(side, 12, "#e8f7ff");
+  } else if (err < 0.13) {
+    G.swing = Math.min(10, G.swing + 0.5);
+    G.v += 2.4;
+    popup("GOOD", "#c5f6ff"); SFX.splashGood(); splash(side, 8, "#e8f7ff");
+  } else {
+    G.swing = Math.max(0, G.swing - 2);
+    G.v += 0.9;
+    popup("OFF BEAT", "#ffcc80"); SFX.splashBad(); splash(side, 5, "#a0c4ff");
+  }
+  G.maxSwing = Math.max(G.maxSwing, Math.floor(G.swing));
+}
+function animOar(side) { if (side === "L") G.oarL = 1; else G.oarR = 1; }
+
+function moveLane(d) {
+  if (state !== "play") return;
+  G.lane = clamp(G.lane + d, 0, 2);
+}
+function jump() {
+  if (state !== "play" || G.jumpH > 0.01) return;
+  G.jumpV = 6.2; G.duck = 0; SFX.jump();
+}
+function duck() {
+  if (state !== "play") return;
+  G.duck = 0.75; if (G.jumpH > 0) G.jumpV = -8;
+}
+
+// ---------- Effects ----------
+function popup(text, color) {
+  popups.push({ text, color, t: 0 });
+  if (popups.length > 3) popups.shift();
+}
+function splash(side, n, color) {
+  const p = proj(G.x, 0, 0);
+  const ox = side === "L" ? -0.75 : side === "R" ? 0.75 : 0;
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      x: p.x + ox * p.s, y: p.y + rand(-5, 10),
+      vx: rand(-60, 60) + ox * 40, vy: rand(-160, -40),
+      life: rand(0.35, 0.7), t: 0, color, r: rand(2, 4.5)
+    });
+  }
+}
+
+// ---------- Update ----------
+function update(dt) {
+  if (state !== "play") return;
+  const g = G;
+
+  // tempo speeds up with distance
+  g.T = clamp(0.52 - g.dist / 26000, 0.36, 0.52);
+  g.beatClock += dt;
+  if (g.beatClock >= g.T) {
+    g.beatClock -= g.T; g.beatCount++; g.ringFlash = 1;
+    const b = g.beatCount % 8;
+    SFX.kick();
+    if (g.swing >= 2 || g.power) SFX.hat();
+    if (g.swing >= 5 || g.power) SFX.bass(BASS[b]);
+    if (g.swing >= 8 || g.power === "cox") SFX.lead(LEAD[b]);
+    if (g.power === "cox") {
+      // auto perfect stroke
+      const side = g.nextSide;
+      g.lastSide = null; g.lastStrokeT = -Infinity;
+      stroke(side, 0, true);
+    }
+  }
+  g.ringFlash = Math.max(0, g.ringFlash - dt * 4);
+
+  // speed
+  if (g.power === "motor") g.v += (30 - g.v) * Math.min(1, dt * 3);
+  g.v -= g.v * 0.33 * dt;
+  g.v = clamp(g.v, 4, 34);
+  const dz = g.v * dt;
+  g.dist += dz; g.offset += dz;
+
+  // swing decays if you stop rowing
+  if (gameTime - g.lastStrokeT > g.T * 2.2 && g.power !== "motor" && g.power !== "cox") g.swing = Math.max(0, g.swing - dt * 2);
+
+  // cop chase
+  g.copSpeed = 11.5 + Math.min(g.dist / 600, 9);
+  g.gap = clamp(g.gap + (g.v - g.copSpeed) * dt * 2.2, -1, 100);
+  if (g.gap < 25) { g.sirenT -= dt; if (g.sirenT <= 0) { SFX.siren(); g.sirenT = 0.6; } }
+  if (g.gap <= 0) { gameOver("Caught by the Cox Cop!"); return; }
+
+  // power
+  if (g.power) { g.powerT -= dt; if (g.powerT <= 0) { g.power = null; popup("POWER OFF", "#ddd"); } }
+
+  // player physics
+  const tx = LANES[g.lane];
+  g.x += (tx - g.x) * Math.min(1, dt * 14);
+  if (g.jumpH > 0 || g.jumpV > 0) {
+    g.jumpV -= 17 * dt; g.jumpH += g.jumpV * dt;
+    if (g.jumpH <= 0) { g.jumpH = 0; g.jumpV = 0; splash(null, 10, "#e8f7ff"); }
+  }
+  g.duck = Math.max(0, g.duck - dt);
+  g.oarL = Math.max(0, g.oarL - dt * 3.2);
+  g.oarR = Math.max(0, g.oarR - dt * 3.2);
+  g.invuln = Math.max(0, g.invuln - dt);
+  g.shake = Math.max(0, g.shake - dt * 3);
+
+  // spawn
+  g.nextSpawn -= dz;
+  if (g.nextSpawn <= 0) {
+    spawnRow(FAR);
+    const diff = clamp(g.dist / 3000, 0, 1);
+    g.nextSpawn = rand(15, 22) - diff * 6;
+  }
+
+  // objects
+  for (const o of g.objs) {
+    o.z -= dz;
+    if (o.done || o.z > 0.7 || o.z < -0.6) continue;
+    const sameLane = o.full || Math.abs(o.x - g.x) < 0.6;
+    if (!sameLane) continue;
+    if (o.type === "coin") {
+      o.done = true; g.coins++; SFX.coin();
+      continue;
+    }
+    if (o.type === "power") {
+      o.done = true; g.power = o.kind; g.powerT = POWER_TIME;
+      popup(POWERS[o.kind].name + "!", POWERS[o.kind].color); SFX.power();
+      continue;
+    }
+    let safe = false;
+    if (o.type === "log" || o.type === "boom") safe = g.jumpH > 0.35;
+    if (o.type === "bridge") safe = g.duck > 0;
+    if (safe) { o.done = true; continue; }
+    if (g.power === "eight") {
+      o.done = true; o.smashed = true; g.shake = 0.5; SFX.crash();
+      splash(null, 18, "#c8a26b"); popup("SMASH!", "#4dd4ff"); continue;
+    }
+    if (g.invuln > 0) { o.done = true; continue; }
+    o.done = true;
+    crash(o.type);
+    if (state !== "play") return;
+  }
+  // magnet at high swing
+  if (g.swing >= 8) {
+    for (const o of g.objs) if (o.type === "coin" && !o.done && o.z < 10 && o.z > 0) o.x += (g.x - o.x) * Math.min(1, dt * 6);
+  }
+  g.objs = g.objs.filter(o => o.z > -3 && !(o.done && o.type !== "barge" && o.type !== "log" && o.type !== "bridge" && o.type !== "boom"));
+
+  g.score = Math.floor(g.dist * (1 + g.maxSwing * 0.1)) + g.coins * 10;
+}
+
+function crash(type) {
+  const g = G;
+  SFX.crash(); g.shake = 1; splash(null, 20, "#c8a26b");
+  g.stumbles++;
+  g.gap -= 35; g.v *= 0.6; g.swing = 0; g.invuln = 1.4;
+  popup(type === "bridge" ? "DUCK! ↓" : type === "barge" ? "CRASH!" : "JUMP! ↑", "#ff5252");
+  if (g.gap <= 0) gameOver("Caught by the Cox Cop!");
+}
+
+function gameOver(reason) {
+  state = "over";
+  G.reason = reason;
+  if (G.score > best) { best = G.score; store.set("strokerush_best", best); G.newBest = true; }
+  totalCoins += G.coins; store.set("strokerush_coins", totalCoins);
+  overAt = gameTime;
+}
+let overAt = 0;
+
+// ---------- Drawing ----------
+const BLDG_COLORS = ["#c2675a", "#d9a05b", "#7d8fa3", "#b8846b", "#8f6d8c", "#d0b48c", "#6c8c7a", "#a35d4f"];
+function hash(n) { const s = Math.sin(n * 127.1) * 43758.5453; return s - Math.floor(s); }
+
+function drawWorld() {
+  const g = geom();
+  const off = G ? G.offset : gameTime * 6;
+  // sky
+  const sky = ctx.createLinearGradient(0, 0, 0, g.horizon);
+  sky.addColorStop(0, "#ff9e6d"); sky.addColorStop(0.6, "#ffcf8a"); sky.addColorStop(1, "#ffe8b8");
+  ctx.fillStyle = sky; ctx.fillRect(0, 0, W, g.horizon + 2);
+  // sun
+  ctx.fillStyle = "rgba(255,255,220,0.9)";
+  ctx.beginPath(); ctx.arc(W * 0.7, g.horizon - H * 0.03, Math.min(W, H) * 0.07, 0, Math.PI * 2); ctx.fill();
+  // distant skyline
+  ctx.fillStyle = "#c98a7a";
+  for (let i = 0; i < 24; i++) {
+    const bw = W / 18, bh = 15 + hash(i + 3) * H * 0.08;
+    ctx.fillRect(i * bw * 0.8 - 10, g.horizon - bh, bw * 0.7, bh);
+  }
+  // water
+  const wat = ctx.createLinearGradient(0, g.horizon, 0, H);
+  wat.addColorStop(0, "#5fb3c9"); wat.addColorStop(1, "#1f6f8f");
+  ctx.fillStyle = wat; ctx.fillRect(0, g.horizon, W, H - g.horizon);
+
+  // banks (quays) + buildings, far to near
+  const seg = 4;
+  const startI = Math.floor(off / seg);
+  for (let k = Math.floor(FAR / seg) + 1; k >= -1; k--) {
+    const i = startI + k;
+    const z0 = i * seg - off, z1 = z0 + seg;
+    if (z1 < -1) continue;
+    for (const sideSign of [-1, 1]) {
+      const a = proj(sideSign * CANAL, z0), b = proj(sideSign * CANAL, z1);
+      const ae = proj(sideSign * 12, z0), be = proj(sideSign * 12, z1);
+      // quay stone
+      ctx.fillStyle = (i % 2) ? "#8a7a6a" : "#7f705f";
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(be.x, be.y); ctx.lineTo(ae.x, ae.y); ctx.fill();
+      // building
+      const h = 2.2 + hash(i * 2 + (sideSign > 0 ? 1 : 0)) * 3.2;
+      const bx = sideSign * (CANAL + 0.35);
+      const f0 = proj(bx, z0, 0), f1 = proj(bx, z1 - 0.4, 0);
+      const t0 = proj(bx, z0, h), t1 = proj(bx, z1 - 0.4, h);
+      const col = BLDG_COLORS[Math.floor(hash(i * 7 + sideSign) * BLDG_COLORS.length)];
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.moveTo(f0.x, f0.y); ctx.lineTo(f1.x, f1.y); ctx.lineTo(t1.x, t1.y); ctx.lineTo(t0.x, t0.y); ctx.fill();
+      // facade toward viewer (front face)
+      const fe = proj(sideSign * 8, z0, 0), te = proj(sideSign * 8, z0, h);
+      ctx.fillStyle = shade(col, -0.18);
+      ctx.beginPath(); ctx.moveTo(f0.x, f0.y); ctx.lineTo(fe.x, fe.y); ctx.lineTo(te.x, te.y); ctx.lineTo(t0.x, t0.y); ctx.fill();
+      // windows on side face
+      if (z0 < 40) {
+        ctx.fillStyle = "rgba(255,240,200,0.55)";
+        for (let wy = 0.6; wy < h - 0.3; wy += 0.9) {
+          for (let wz = 0.5; wz < seg - 0.8; wz += 1.3) {
+            const p = proj(bx, z0 + wz, wy), q = proj(bx, z0 + wz + 0.5, wy + 0.45);
+            ctx.fillRect(Math.min(p.x, q.x), q.y, Math.abs(q.x - p.x) + 1, p.y - q.y);
+          }
+        }
+      }
+    }
+  }
+  // water sheen lines
+  ctx.strokeStyle = "rgba(255,255,255,0.18)"; ctx.lineWidth = 2;
+  for (let i = 0; i < 26; i++) {
+    const z = ((i * 3.1 - off * 1.0) % 78 + 78) % 78 - 2;
+    const lx = (hash(i) - 0.5) * 3.2;
+    const p = proj(lx, z), q = proj(lx + 0.4, z);
+    ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+  }
+  // lane dividers (buoy ropes)
+  for (const lx of [-0.575, 0.575]) {
+    for (let k = 0; k < 30; k++) {
+      const z = ((k * 2.5 - off) % 75 + 75) % 75 - 1;
+      const p = proj(lx, z);
+      ctx.fillStyle = k % 2 ? "rgba(255,255,255,0.5)" : "rgba(255,90,90,0.5)";
+      ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(1, p.s * 0.035), 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  const f = c => clamp(Math.round(c + (amt < 0 ? c * amt : (255 - c) * amt)), 0, 255);
+  return "rgb(" + f(r) + "," + f(g) + "," + f(b) + ")";
+}
+
+function drawObj(o) {
+  if (o.done && (o.type === "coin" || o.type === "power")) return;
+  if (o.smashed) return;
+  const p = proj(o.x, o.z, o.y || 0);
+  const s = p.s;
+  if (s < 2) return;
+  if (o.type === "coin") {
+    const spin = Math.abs(Math.cos(gameTime * 5 + o.z));
+    ctx.fillStyle = "#ffd23f"; ctx.strokeStyle = "#b8860b"; ctx.lineWidth = Math.max(1, s * 0.03);
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, s * 0.16 * (0.3 + spin * 0.7), s * 0.16, 0, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+  } else if (o.type === "power") {
+    const P = POWERS[o.kind];
+    const bob = Math.sin(gameTime * 4) * s * 0.05;
+    ctx.fillStyle = P.color; ctx.globalAlpha = 0.35;
+    ctx.beginPath(); ctx.arc(p.x, p.y + bob, s * 0.32, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(p.x, p.y + bob, s * 0.22, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#1a1a2e"; ctx.font = "bold " + Math.round(s * 0.26) + "px sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(P.icon, p.x, p.y + bob + 1);
+  } else if (o.type === "barge") {
+    // floating crate barge
+    const w = 0.95, d = 1.2, h = 0.9;
+    box(o.x, o.z, w, d, h, "#9c6b3f", "#7a5230", "#b8834f");
+    // crates stripe
+    const t = proj(o.x, o.z, h * 0.5);
+    ctx.strokeStyle = "rgba(0,0,0,0.25)"; ctx.lineWidth = Math.max(1, s * 0.03);
+    ctx.beginPath(); ctx.moveTo(t.x - s * w * 0.5, t.y); ctx.lineTo(t.x + s * w * 0.5, t.y); ctx.stroke();
+  } else if (o.type === "log") {
+    const a = proj(o.x - 0.5, o.z, 0.12), b = proj(o.x + 0.5, o.z, 0.12);
+    ctx.strokeStyle = "#6b4423"; ctx.lineCap = "round"; ctx.lineWidth = Math.max(2, s * 0.24);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.fillStyle = "#c79a6b";
+    ctx.beginPath(); ctx.ellipse(b.x, b.y, s * 0.06, s * 0.11, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.lineCap = "butt";
+  } else if (o.type === "boom") {
+    // floating barrier across canal: jump
+    const a = proj(-CANAL, o.z, 0.15), b = proj(CANAL, o.z, 0.15);
+    ctx.strokeStyle = "#ffeb3b"; ctx.lineWidth = Math.max(2, s * 0.14);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+    ctx.strokeStyle = "#222"; ctx.lineWidth = Math.max(1, s * 0.14); ctx.setLineDash([s * 0.2, s * 0.2]);
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke(); ctx.setLineDash([]);
+    for (const lx of [-1.6, -0.55, 0.55, 1.6]) {
+      const q = proj(lx, o.z, 0.15);
+      ctx.fillStyle = "#ff5722"; ctx.beginPath(); ctx.arc(q.x, q.y, s * 0.1, 0, Math.PI * 2); ctx.fill();
+    }
+  } else if (o.type === "bridge") {
+    // low stone bridge: duck
+    const yb = 0.75, yt = 1.25;
+    const a = proj(-CANAL - 0.4, o.z, yb), b = proj(CANAL + 0.4, o.z, yb);
+    const c = proj(CANAL + 0.4, o.z, yt), d = proj(-CANAL - 0.4, o.z, yt);
+    ctx.fillStyle = "#a89584";
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.fill();
+    // arch shadow underside
+    ctx.fillStyle = "#6e5f52";
+    ctx.fillRect(a.x, a.y - s * 0.06, b.x - a.x, s * 0.06);
+    // railing
+    const r1 = proj(-CANAL - 0.4, o.z, yt + 0.25), r2 = proj(CANAL + 0.4, o.z, yt + 0.25);
+    ctx.strokeStyle = "#5d4e42"; ctx.lineWidth = Math.max(1, s * 0.05);
+    ctx.beginPath(); ctx.moveTo(r1.x, r1.y); ctx.lineTo(r2.x, r2.y); ctx.stroke();
+    for (let i = 0; i <= 8; i++) {
+      const lx = -CANAL - 0.4 + i * (CANAL * 2 + 0.8) / 8;
+      const p1 = proj(lx, o.z, yt), p2 = proj(lx, o.z, yt + 0.25);
+      ctx.beginPath(); ctx.moveTo(p1.x, p1.y); ctx.lineTo(p2.x, p2.y); ctx.stroke();
+    }
+    // pillars
+    for (const sx of [-1, 1]) {
+      const p0 = proj(sx * (CANAL + 0.1), o.z, 0), p1 = proj(sx * (CANAL + 0.1), o.z, yb);
+      ctx.fillStyle = "#8c7a6a";
+      ctx.fillRect(p0.x - s * 0.15, p1.y, s * 0.3, p0.y - p1.y);
+    }
+    // stones
+    ctx.strokeStyle = "rgba(0,0,0,0.15)"; ctx.lineWidth = 1;
+    for (let i = 1; i < 10; i++) {
+      const x = a.x + (b.x - a.x) * i / 10;
+      ctx.beginPath(); ctx.moveTo(x, a.y); ctx.lineTo(x, d.y); ctx.stroke();
+    }
+  }
+}
+function box(x, z, w, d, h, cFront, cSide, cTop) {
+  const fl = proj(x - w / 2, z, 0), fr = proj(x + w / 2, z, 0);
+  const tl = proj(x - w / 2, z, h), tr = proj(x + w / 2, z, h);
+  const btl = proj(x - w / 2, z + d, h), btr = proj(x + w / 2, z + d, h);
+  // top
+  ctx.fillStyle = cTop;
+  ctx.beginPath(); ctx.moveTo(tl.x, tl.y); ctx.lineTo(tr.x, tr.y); ctx.lineTo(btr.x, btr.y); ctx.lineTo(btl.x, btl.y); ctx.fill();
+  // side visible toward center
+  const bfl = proj(x - w / 2, z + d, 0), bfr = proj(x + w / 2, z + d, 0);
+  ctx.fillStyle = cSide;
+  if (x > 0.1) { ctx.beginPath(); ctx.moveTo(fl.x, fl.y); ctx.lineTo(bfl.x, bfl.y); ctx.lineTo(btl.x, btl.y); ctx.lineTo(tl.x, tl.y); ctx.fill(); }
+  if (x < -0.1) { ctx.beginPath(); ctx.moveTo(fr.x, fr.y); ctx.lineTo(bfr.x, bfr.y); ctx.lineTo(btr.x, btr.y); ctx.lineTo(tr.x, tr.y); ctx.fill(); }
+  // front
+  ctx.fillStyle = cFront;
+  ctx.beginPath(); ctx.moveTo(fl.x, fl.y); ctx.lineTo(fr.x, fr.y); ctx.lineTo(tr.x, tr.y); ctx.lineTo(tl.x, tl.y); ctx.fill();
+}
+
+function drawPlayer() {
+  const g = G;
+  const p = proj(g.x, 0, 0);
+  const s = p.s;
+  const lift = g.jumpH * s;
+  const cx = p.x, cy = p.y - lift;
+  // shadow
+  ctx.fillStyle = "rgba(0,30,50,0.3)";
+  ctx.beginPath(); ctx.ellipse(p.x, p.y + s * 0.05, s * 0.35 * (1 - g.jumpH * 0.15), s * 0.1, 0, 0, Math.PI * 2); ctx.fill();
+  if (g.invuln > 0 && Math.floor(gameTime * 14) % 2) ctx.globalAlpha = 0.45;
+
+  const eight = g.power === "eight";
+  const hullW = s * (eight ? 0.34 : 0.26), hullL = s * (eight ? 1.25 : 0.85);
+  // wake
+  if (g.jumpH < 0.05) {
+    ctx.fillStyle = "rgba(255,255,255,0.35)";
+    ctx.beginPath(); ctx.moveTo(cx - hullW, cy + s * 0.05); ctx.lineTo(cx - hullW * 2.2, cy + s * 0.4);
+    ctx.lineTo(cx + hullW * 2.2, cy + s * 0.4); ctx.lineTo(cx + hullW, cy + s * 0.05); ctx.fill();
+  }
+  // oars
+  const rowers = eight ? [-0.55, -0.3, -0.05] : [-0.15];
+  for (const ry of rowers) {
+    for (const side of [-1, 1]) {
+      const anim = side < 0 ? g.oarL : g.oarR;
+      const sweep = Math.sin((1 - anim) * Math.PI) * 0.6 * (anim > 0 ? 1 : 0);
+      const ang = side < 0 ? Math.PI + 0.15 - sweep : -0.15 + sweep;
+      const ox = cx + side * hullW * 0.7, oy = cy + ry * s;
+      const len = s * 0.75;
+      ctx.strokeStyle = "#f4e2c1"; ctx.lineWidth = Math.max(2, s * 0.035);
+      ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(ox + Math.cos(ang) * len, oy + Math.sin(ang) * len * 0.4); ctx.stroke();
+      ctx.fillStyle = g.power === "motor" ? "#777" : "#e63946";
+      ctx.beginPath(); ctx.ellipse(ox + Math.cos(ang) * len, oy + Math.sin(ang) * len * 0.4, s * 0.09, s * 0.035, ang, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  // hull (pointed bow at top)
+  ctx.fillStyle = eight ? "#1d3557" : "#f1faee";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - hullL);
+  ctx.quadraticCurveTo(cx + hullW * 1.2, cy - hullL * 0.3, cx + hullW, cy + s * 0.1);
+  ctx.lineTo(cx - hullW, cy + s * 0.1);
+  ctx.quadraticCurveTo(cx - hullW * 1.2, cy - hullL * 0.3, cx, cy - hullL);
+  ctx.fill();
+  ctx.fillStyle = eight ? "#4dd4ff" : "#e63946";
+  ctx.fillRect(cx - hullW, cy + s * 0.04, hullW * 2, s * 0.06);
+  // motor
+  if (g.power === "motor") {
+    ctx.fillStyle = "#333"; ctx.fillRect(cx - s * 0.07, cy + s * 0.08, s * 0.14, s * 0.16);
+    if (Math.floor(gameTime * 20) % 2) { ctx.fillStyle = "rgba(255,255,255,0.7)"; ctx.beginPath(); ctx.arc(cx, cy + s * 0.3, s * 0.08, 0, Math.PI * 2); ctx.fill(); }
+  }
+  // rowers
+  const duckF = g.duck > 0 ? 0.45 : 1;
+  for (const ry of rowers) {
+    const by = cy + ry * s;
+    ctx.fillStyle = "#264653";
+    ctx.beginPath(); ctx.ellipse(cx, by, s * 0.13, s * 0.17 * duckF, 0, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#f4a261";
+    ctx.beginPath(); ctx.arc(cx, by - s * 0.2 * duckF, s * 0.085, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#e76f51";
+    ctx.beginPath(); ctx.arc(cx, by - s * 0.22 * duckF, s * 0.085, Math.PI, Math.PI * 2); ctx.fill();
+  }
+  // coxswain
+  if (g.power === "cox") {
+    const by = cy - s * 0.55;
+    ctx.fillStyle = "#ffd23f"; ctx.beginPath(); ctx.arc(cx, by, s * 0.07, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "bold " + Math.round(s * 0.14) + "px sans-serif"; ctx.textAlign = "center";
+    if (g.ringFlash > 0.5) ctx.fillText("ROW!", cx, by - s * 0.15);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawCop() {
+  const g = G;
+  if (g.gap > 45) return;
+  const p = proj(g.x * 0.6, 0, 0);
+  const s = p.s;
+  const y = p.y + s * 0.55 + g.gap * s * 0.03;
+  const x = p.x;
+  ctx.fillStyle = "#2b2d42";
+  ctx.beginPath(); ctx.moveTo(x, y - s * 0.6); ctx.lineTo(x + s * 0.45, y - s * 0.1); ctx.lineTo(x + s * 0.4, y + s * 0.6);
+  ctx.lineTo(x - s * 0.4, y + s * 0.6); ctx.lineTo(x - s * 0.45, y - s * 0.1); ctx.fill();
+  ctx.fillStyle = "#edf2f4"; ctx.fillRect(x - s * 0.25, y - s * 0.15, s * 0.5, s * 0.3);
+  ctx.fillStyle = "#2b2d42"; ctx.font = "bold " + Math.round(s * 0.1) + "px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText("COX COP", x, y);
+  const flash = Math.floor(gameTime * 6) % 2;
+  ctx.fillStyle = flash ? "#ff1744" : "#2979ff";
+  ctx.beginPath(); ctx.arc(x - s * 0.12, y - s * 0.28, s * 0.07, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = flash ? "#2979ff" : "#ff1744";
+  ctx.beginPath(); ctx.arc(x + s * 0.12, y - s * 0.28, s * 0.07, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawRhythm() {
+  const g = G;
+  const p = proj(g.x, 0, g.jumpH);
+  const R = p.s * 0.55;
+  const phase = g.beatClock / g.T;           // 0 just after beat → 1 at next beat
+  const ringR = R * (1 + (1 - phase) * 1.1);
+  const good = beatError() < 0.13;
+  // target
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = good ? "rgba(124,255,178,0.9)" : "rgba(255,255,255,0.45)";
+  ctx.beginPath(); ctx.arc(p.x, p.y - p.s * 0.35, R, 0, Math.PI * 2); ctx.stroke();
+  // shrinking ring
+  if (g.power !== "motor") {
+    ctx.strokeStyle = "rgba(255,255,255," + (0.25 + phase * 0.6) + ")";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y - p.s * 0.35, ringR, 0, Math.PI * 2); ctx.stroke();
+  }
+  if (g.ringFlash > 0) {
+    ctx.fillStyle = "rgba(124,255,178," + g.ringFlash * 0.18 + ")";
+    ctx.beginPath(); ctx.arc(p.x, p.y - p.s * 0.35, R, 0, Math.PI * 2); ctx.fill();
+  }
+}
+
+function drawSideHints() {
+  if (G.power === "motor" || G.power === "cox") return;
+  const next = G.nextSide;
+  const a = 0.06 + G.ringFlash * 0.08;
+  ctx.fillStyle = "rgba(255,255,255," + a + ")";
+  if (next === "L") ctx.fillRect(0, H * 0.55, W * 0.12, H * 0.45);
+  else ctx.fillRect(W * 0.88, H * 0.55, W * 0.12, H * 0.45);
+  ctx.fillStyle = "rgba(255,255,255,0.5)"; ctx.font = "bold 16px sans-serif"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(next === "L" ? "L" : "R", next === "L" ? W * 0.06 : W * 0.94, H * 0.9);
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function drawHUD() {
+  const g = G;
+  const pad = 14;
+  ctx.textBaseline = "top"; ctx.textAlign = "left";
+  ctx.fillStyle = "rgba(10,30,50,0.55)"; roundRect(pad, pad, 150, 58, 12); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 24px sans-serif"; ctx.fillText(g.score.toLocaleString(), pad + 12, pad + 6);
+  ctx.font = "13px sans-serif"; ctx.fillStyle = "#ffd23f"; ctx.fillText("● " + g.coins + "   " + Math.floor(g.dist) + " m", pad + 12, pad + 36);
+
+  // swing meter
+  const sw = 150, sx = W - sw - pad;
+  ctx.fillStyle = "rgba(10,30,50,0.55)"; roundRect(sx, pad, sw, 58, 12); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.font = "bold 13px sans-serif"; ctx.textAlign = "left";
+  ctx.fillText("SWING  x" + (1 + Math.floor(g.swing) * 0.05).toFixed(2), sx + 12, pad + 8);
+  for (let i = 0; i < 10; i++) {
+    ctx.fillStyle = i < Math.floor(g.swing) ? (i >= 7 ? "#7cffb2" : i >= 4 ? "#c5f6ff" : "#6ec6ff") : "rgba(255,255,255,0.15)";
+    ctx.fillRect(sx + 12 + i * 12.6, pad + 30, 10, 16);
+  }
+
+  // cop gap bar
+  const bw = Math.min(260, W - 2 * pad - 320);
+  if (bw > 80) {
+    const bx = W / 2 - bw / 2;
+    ctx.fillStyle = "rgba(10,30,50,0.55)"; roundRect(bx, pad, bw, 34, 10); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "bold 11px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText("COX COP DISTANCE", W / 2, pad + 4);
+    ctx.fillStyle = "rgba(255,255,255,0.15)"; ctx.fillRect(bx + 10, pad + 20, bw - 20, 7);
+    ctx.fillStyle = g.gap < 25 ? "#ff5252" : g.gap < 50 ? "#ffb74d" : "#7cffb2";
+    ctx.fillRect(bx + 10, pad + 20, (bw - 20) * clamp(g.gap, 0, 100) / 100, 7);
+  } else {
+    ctx.fillStyle = g.gap < 25 ? "#ff5252" : g.gap < 50 ? "#ffb74d" : "#7cffb2";
+    ctx.fillRect(pad, pad + 64, (W - 2 * pad) * clamp(g.gap, 0, 100) / 100, 5);
+  }
+
+  // power timer
+  if (g.power) {
+    const P = POWERS[g.power];
+    ctx.fillStyle = P.color; ctx.font = "bold 15px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(P.name + "  " + g.powerT.toFixed(1) + "s", W / 2, pad + 76);
+  }
+
+  // popups
+  for (const pu of popups) {
+    const a = 1 - pu.t / 0.8;
+    if (a <= 0) continue;
+    ctx.globalAlpha = a; ctx.fillStyle = pu.color; ctx.font = "bold 26px sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(pu.text, W / 2, H * 0.4 - pu.t * 50);
+  }
+  ctx.globalAlpha = 1;
+
+  // pause button
+  ctx.fillStyle = "rgba(10,30,50,0.55)"; roundRect(pad, H - 54, 40, 40, 10); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.fillRect(pad + 13, H - 44, 5, 20); ctx.fillRect(pad + 23, H - 44, 5, 20);
+}
+
+function drawParticles(dt) {
+  for (const p of particles) {
+    p.t += dt; p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 420 * dt;
+    const a = 1 - p.t / p.life; if (a <= 0) continue;
+    ctx.globalAlpha = a; ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  for (let i = particles.length - 1; i >= 0; i--) if (particles[i].t >= particles[i].life) particles.splice(i, 1);
+  for (let i = popups.length - 1; i >= 0; i--) { popups[i].t += dt; if (popups[i].t > 0.8) popups.splice(i, 1); }
+}
+
+function panel(lines, y0) {
+  ctx.fillStyle = "rgba(8,24,40,0.78)";
+  const pw = Math.min(W - 30, 420), ph = Math.min(H - 40, 470);
+  const px = W / 2 - pw / 2, py = y0 || H / 2 - ph / 2;
+  roundRect(px, py, pw, ph, 18); ctx.fill();
+  return { px, py, pw, ph };
+}
+
+function drawTitle() {
+  const { px, py, pw, ph } = panel();
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#ffd23f"; ctx.font = "bold 44px 'Trebuchet MS', sans-serif";
+  ctx.fillText("STROKE RUSH", W / 2, py + 24);
+  ctx.fillStyle = "#c5f6ff"; ctx.font = "15px sans-serif";
+  ctx.fillText("Row the flooded city. Outrun the Cox Cop.", W / 2, py + 76);
+  const rows = [
+    ["Tap LEFT / RIGHT half", "Row — alternate sides"],
+    ["Hit the beat", "Tap as the ring meets the circle"],
+    ["Swipe ← →", "Change canal lane"],
+    ["Swipe ↑", "Jump logs & yellow booms"],
+    ["Swipe ↓", "Duck under low bridges"],
+    ["Keyboard", "Z/X row · arrows move"]
+  ];
+  ctx.font = "14px sans-serif";
+  rows.forEach((r, i) => {
+    const y = py + 112 + i * 34;
+    ctx.textAlign = "left"; ctx.fillStyle = "#fff"; ctx.font = "bold 14px sans-serif";
+    ctx.fillText(r[0], px + 24, y);
+    ctx.textAlign = "right"; ctx.fillStyle = "#a9c7da"; ctx.font = "14px sans-serif";
+    ctx.fillText(r[1], px + pw - 24, y);
+  });
+  ctx.textAlign = "center";
+  const pulse = 0.6 + Math.sin(gameTime * 4) * 0.4;
+  ctx.fillStyle = "rgba(124,255,178," + pulse + ")"; ctx.font = "bold 22px sans-serif";
+  ctx.fillText("TAP TO START", W / 2, py + ph - 88);
+  ctx.fillStyle = "#a9c7da"; ctx.font = "13px sans-serif";
+  ctx.fillText("Best " + best.toLocaleString() + "  ·  Coins " + totalCoins, W / 2, py + ph - 50);
+  ctx.fillText("Mash = splash. Rhythm = speed.", W / 2, py + ph - 30);
+}
+
+function drawOver() {
+  const { py, ph } = panel();
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#ff5252"; ctx.font = "bold 36px sans-serif";
+  ctx.fillText("BUSTED!", W / 2, py + 26);
+  ctx.fillStyle = "#c5f6ff"; ctx.font = "15px sans-serif";
+  ctx.fillText(G.reason || "", W / 2, py + 72);
+  ctx.fillStyle = "#fff"; ctx.font = "bold 48px sans-serif";
+  ctx.fillText(G.score.toLocaleString(), W / 2, py + 108);
+  if (G.newBest) { ctx.fillStyle = "#ffd23f"; ctx.font = "bold 16px sans-serif"; ctx.fillText("NEW BEST!", W / 2, py + 164); }
+  ctx.fillStyle = "#a9c7da"; ctx.font = "15px sans-serif";
+  const stats = [
+    "Distance  " + Math.floor(G.dist) + " m",
+    "Coins  " + G.coins,
+    "Perfect strokes  " + G.perfects,
+    "Max swing  " + G.maxSwing + " / 10",
+    "Best  " + best.toLocaleString()
+  ];
+  stats.forEach((s, i) => ctx.fillText(s, W / 2, py + 196 + i * 26));
+  if (gameTime - overAt > 0.8) {
+    const pulse = 0.6 + Math.sin(gameTime * 4) * 0.4;
+    ctx.fillStyle = "rgba(124,255,178," + pulse + ")"; ctx.font = "bold 22px sans-serif";
+    ctx.fillText("TAP TO ROW AGAIN", W / 2, py + ph - 56);
+  }
+}
+
+function drawPaused() {
+  ctx.fillStyle = "rgba(8,24,40,0.6)"; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.font = "bold 40px sans-serif"; ctx.fillText("PAUSED", W / 2, H / 2 - 20);
+  ctx.font = "16px sans-serif"; ctx.fillText("Tap to resume", W / 2, H / 2 + 24);
+}
+
+// ---------- Loop ----------
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  dt = clamp(dt, 0, 0.05);
+  if (state !== "paused") gameTime += dt;
+  if (state === "play") update(dt);
+
+  ctx.save();
+  if (G && G.shake > 0) ctx.translate(rand(-1, 1) * G.shake * 8, rand(-1, 1) * G.shake * 8);
+  drawWorld();
+  if (G && state !== "title") {
+    const sorted = G.objs.slice().sort((a, b) => b.z - a.z);
+    for (const o of sorted) if (o.z > 0.3) drawObj(o);
+    drawRhythm();
+    drawPlayer();
+    for (const o of sorted) if (o.z <= 0.3) drawObj(o);
+    drawCop();
+    drawParticles(state === "paused" ? 0 : dt);
+    drawSideHints();
+    drawHUD();
+  }
+  ctx.restore();
+  if (state === "title") drawTitle();
+  if (state === "over") drawOver();
+  if (state === "paused") drawPaused();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---------- Input ----------
+function startOrResume() {
+  initAudio();
+  if (state === "title" || (state === "over" && gameTime - overAt > 0.8)) { newGame(); state = "play"; return true; }
+  if (state === "paused") { state = "play"; last = performance.now(); return true; }
+  return state === "over";
+}
+
+let ptr = null;
+cv.addEventListener("pointerdown", e => {
+  e.preventDefault();
+  if (state !== "play") { startOrResume(); return; }
+  // pause button
+  if (e.clientX < 60 && e.clientY > H - 60) { state = "paused"; return; }
+  ptr = { id: e.pointerId, x: e.clientX, y: e.clientY, err: beatError(), side: e.clientX < W / 2 ? "L" : "R", resolved: false, t: performance.now() };
+}, { passive: false });
+cv.addEventListener("pointermove", e => {
+  if (!ptr || ptr.id !== e.pointerId || ptr.resolved) return;
+  const dx = e.clientX - ptr.x, dy = e.clientY - ptr.y;
+  if (Math.hypot(dx, dy) > 28) {
+    ptr.resolved = true;
+    if (Math.abs(dx) > Math.abs(dy)) moveLane(dx > 0 ? 1 : -1);
+    else if (dy < 0) jump(); else duck();
+  }
+});
+function endPtr(e) {
+  if (!ptr || ptr.id !== e.pointerId) return;
+  if (!ptr.resolved) stroke(ptr.side, ptr.err);
+  ptr = null;
+}
+cv.addEventListener("pointerup", endPtr);
+cv.addEventListener("pointercancel", e => { if (ptr && ptr.id === e.pointerId) ptr = null; });
+// long-held taps still count as strokes
+setInterval(() => {
+  if (ptr && !ptr.resolved && performance.now() - ptr.t > 180) { ptr.resolved = true; stroke(ptr.side, ptr.err); }
+}, 30);
+
+window.addEventListener("keydown", e => {
+  const k = e.key.toLowerCase();
+  if (state !== "play") {
+    if (k === " " || k === "enter" || k === "z" || k === "x") startOrResume();
+    if (k === "p" || k === "escape") if (state === "paused") startOrResume();
+    return;
+  }
+  if (e.repeat) return;
+  if (k === "z" || k === "f") stroke("L");
+  else if (k === "x" || k === "j") stroke("R");
+  else if (k === "arrowleft" || k === "a") moveLane(-1);
+  else if (k === "arrowright" || k === "d") moveLane(1);
+  else if (k === "arrowup" || k === "w" || k === " ") jump();
+  else if (k === "arrowdown" || k === "s") duck();
+  else if (k === "p" || k === "escape") state = "paused";
+  else return;
+  e.preventDefault();
+});
+document.addEventListener("visibilitychange", () => { if (document.hidden && state === "play") state = "paused"; });
+
+// offline install support
+if ("serviceWorker" in navigator && location.protocol === "https:") {
+  try { navigator.serviceWorker.register("sw.js").catch(() => {}); } catch (e) {}
+}
+// test hook
+window.__SR = { get state() { return state; }, get G() { return G; }, newGame, stroke, update, moveLane, jump, duck, setState(s) { state = s; } };
+})();
+</script>
+</body>
+</html>
